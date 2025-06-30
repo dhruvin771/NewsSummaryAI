@@ -1,6 +1,5 @@
 import json
 
-# 1. This is the JSON response you would receive from the API
 json_response_string = """
 {
   "status": true,

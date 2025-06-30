@@ -30,11 +30,4 @@ async def send_webhook_message():
     
     print("Message sent successfully!")
 
-async def send_multiple_messages():
-    count = 5  # Change this number for how many messages you want
-    for i in range(count):
-        await send_webhook_message()
-        await asyncio.sleep(1)  # Wait 1 second between messages
-        print(f"Sent message {i+1}")
-
-asyncio.run(send_multiple_messages())
+send_webhook_message()

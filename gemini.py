@@ -1,53 +1,140 @@
 import google.generativeai as genai
 import dotenv
 import os
+import json
+from pymongo import MongoClient
+from prompts import system_prompt
+from googlenewsdecoder import gnewsdecoder
+import schedule
+import time
+import threading
+import discord
+import aiohttp
 
 dotenv.load_dotenv()
 
-# Configure API key
 genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+MONGO_URI = os.getenv("MONGO_DB_SRC")
+DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
+
+
+DB_NAME = "AI"
+COLLECTION_NAME = "news"
+
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+collection = db[COLLECTION_NAME]
 
 model = genai.GenerativeModel(
-    model_name="gemini-2.5-pro",
-    system_instruction='''
-You are a concise and clear news summarizer.
+        model_name="gemini-2.5-pro",
+        generation_config={"response_mime_type": "application/json"},
+        system_instruction=system_prompt
+    )
 
-When the user provides a news article link or text, generate a short and simple summary that includes:
+async def send_webhook_message(title, summary, img_url, priority):
+    if priority == "high":
+        color = 0xFF0000  
+    elif priority == "medium":
+        color = 0xFFA500  
+    else:
+        color = 0x00FF00  
+        
+    embed = discord.Embed(
+        title=title if title else "News Summary",
+        color=color,
+        description=summary if summary else "No summary available."
+    )
+    if img_url:
+        embed.set_image(url=img_url)
+    
+    async with aiohttp.ClientSession() as session:
+        webhook = discord.Webhook.from_url(DISCORD_WEBHOOK_URL, session=session)
+        await webhook.send(
+            embed=embed,
+            username="lisu",
+            avatar_url="https://www.thestatesman.com/wp-content/uploads/2025/05/blackpink-lisa-k-pop-lisa-documentary-jpg.webp"
+        )
+    print("Message sent successfully!")
 
-* A short paragraph clearly stating the main points of the article.
-* Bullet points for any important supporting facts or details.
-* An “> ” line if there is a key takeaway, urgent information, or message the reader should not miss.in readme format highlight 
+def process_pending_article():
+    doc = collection.find_one({"status": "pending"})
+    if not doc:
+        print("No pending articles found.")
+        return
 
-Keep the language simple, direct, and easy to understand. Avoid unnecessary details or jargon. Always base your summary strictly on the provided article content.
+    link = doc.get("link")
+    if not link:
+        print("No link found in the document.")
+        return
 
-Your final response must be returned as JSON in the following format:
+    try:
+        decoded = gnewsdecoder(link, interval=2)
+        if decoded.get("status"):
+            url_to_summarize = decoded["decoded_url"]
+            print("Decoded URL:", url_to_summarize)
+        else:
+            collection.update_one(
+                {"_id": doc["_id"]},
+                {"$set": {"status": "completed", "summary": True, "priority": None}}
+            )
+            print(f"Decoding failed. Updated document {doc['_id']} as completed with summary=True.")
+            return
+    except Exception as e:
+        print(f"Error decoding link: {e}")
+        collection.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"status": "completed", "summary": True, "priority": None}}
+        )
+        print(f"Exception during decoding. Updated document {doc['_id']} as completed with summary=True.")
+        return
 
-{
-  "status": true/false, // true if the summary was successfully generated, false otherwise
-  "summary": "<the short and simple summary text here>",
-  "title": "<a short AI-generated title for the article>"
-  "priority":"high/medium/low"
-}
+    response = model.generate_content(url_to_summarize)
+    try:
+        data = json.loads(response.text)
+    except Exception:
+        collection.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"status": "completed", "summary": True, "priority": None}}
+        )
+        return
+    print(data)
 
-Example of a summary:
+    if data.get("status"):
+      update_fields = {
+          "status": "completed",
+          "send":True,
+          "summary": data.get("summary"),
+          "priority": data.get("priority")
+      }
+      collection.update_one({"_id": doc["_id"]}, {"$set": update_fields})
+      title = data.get("title") or doc.get("title")
+      summary = data.get("summary")
+      img_url = doc.get("img")
+      priority = data.get("priority")
 
----
+      import asyncio
+      asyncio.run(send_webhook_message(title, summary, img_url, priority))
+      print(f"Updated document {doc['_id']} with summary and priority.")
+    else:
+        collection.update_one(
+            {"_id": doc["_id"]},
+            {"$set": {"status": "completed", "summary": True, "priority": None}}
+        )
+        return
 
-Sure! Here’s a short and simple summary of the article you shared:
+def run_scheduler():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
-Google has launched Gemini CLI, a free, open-source command-line tool that helps developers create and test AI agents more easily. The tool simplifies building workflows where AI agents can plan and execute tasks.
-
-* Gemini CLI is free and open source on GitHub.
-* Supports developers in building, testing, and debugging AI agents.
-* Helps create multi-step task workflows for AI agents.
-* Will integrate with Google AI Studio and other tools.
-
->  Gemini CLI gives developers more control to build custom AI agents, which could speed up AI innovation.
-
-----------------
-dont write any explaination or comment just return json'''
-)
-
-# Use the model
-response = model.generate_content("https://www.thehindu.com/news/national/ahmedabad-plane-crash-government-says-data-extraction-from-black-boxes-underway/article69739587.ece")
-print(response.text)
+if __name__ == "__main__":
+    schedule.every(1).minutes.do(process_pending_article)
+    print("Scheduler started. Press Ctrl+C to stop.")
+    process_pending_article()
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopping the application...")

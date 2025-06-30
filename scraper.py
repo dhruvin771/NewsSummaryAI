@@ -1,42 +1,26 @@
 from GoogleNews import GoogleNews
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
+import os
+import re
+from pymongo import MongoClient
+from dotenv import load_dotenv
+import schedule
+import threading
+
+load_dotenv()
+
+MONGO_URI = os.getenv("MONGO_DB_SRC")
+DB_NAME = "AI"
+COLLECTION_NAME = "news"
+
+client = MongoClient(MONGO_URI)
+db = client[DB_NAME]
+collection = db[COLLECTION_NAME]
 
 list_of_topics = [{
     "topic": "Artificial Intelligence",
-    "topic_id": "CAAqKggKIiRDQkFTRlFvSUwyMHZNRGRqTVhZU0JXVnVMVWRDR2dKSlRpZ0FQAQ"
-},
-{
-    "topic": "Computing",
-    "topic_id": "CAAqJQgKIh9DQkFTRVFvSUwyMHZNREZzY0hNU0JXVnVMVWRDS0FBUAE"
-},
-{
-    "topic": "OpenAI",
-    "topic_id": "CAAqLAgKIiZDQkFTRmdvTkwyY3ZNVEZpZUdNMk5UWjJOaElGWlc0dFIwSW9BQVAB"
-},
-{
-    "topic": "Physics",
-    "topic_id": "CAAqJQgKIh9DQkFTRVFvSUwyMHZNRFZ4YW5RU0JXVnVMVWRDS0FBUAE"
-},
-{
-    "topic": "Machine Learning",
-    "topic_id": "CAAqJggKIiBDQkFTRWdvSkwyMHZNREZvZVdoZkVnVmxiaTFIUWlnQVAB"
-},
-{
-    "topic": "Deep Learning",
-    "topic_id": "CAAqKAgKIiJDQkFTRXdvS0wyMHZNR2d4Wm00NGFCSUZaVzR0UjBJb0FBUAE"
-},
-{
-    "topic": "Science",
-    "topic_id": "CAAqKggKIiRDQkFTRlFvSUwyMHZNRFp0Y1RjU0JXVnVMVWRDR2dKSlRpZ0FQAQ"
-},
-{
-    "topic": "World",
-    "topic_id": "CAAqKggKIiRDQkFTRlFvSUwyMHZNRGx1YlY4U0JXVnVMVWRDR2dKSlRpZ0FQAQ"
-},
-{
-    "topic": "Internet",
-    "topic_id": "CAAqKggKIiRDQkFTRlFvSUwyMHZNRGRqTVhZU0JXVnVMVWRDR2dKSlRpZ0FQAQ"
+    "topic_id": "CAAqJAgKIh5DQkFTRUFvSEwyMHZNRzFyZWhJRlpXNHRSMElvQUFQAQ"
 }]
 
 def convert_to_epoch_and_time_ago(timestamp):
@@ -52,49 +36,115 @@ def convert_to_epoch_and_time_ago(timestamp):
     except Exception as e:
         return None, False
 
-def process_news_data(data, topic_name, method_type):
-    print(f"\n{'='*60}")
-    print(f"TOPIC: {topic_name} ({method_type})")
-    print(f"{'='*60}")
+def is_duplicate_article(title, link):
+    title_pattern = re.compile(re.escape(title), re.IGNORECASE)
     
+    existing_article = collection.find_one({
+        "$or": [
+            {"title": title_pattern},
+            {"link": link}
+        ]
+    })
+    
+    return existing_article is not None
+
+def save_to_mongodb(article_data, topic_name):
+    title = article_data.get('title', '')
+    link = article_data.get('link', '')
+    
+    if not title or not link:
+        return False
+    
+    if is_duplicate_article(title, link):
+        return False
+    
+    epoch_time, status = convert_to_epoch_and_time_ago(article_data.get('datetime'))
+    if not status:
+        print(f"Error converting time for article: {title}")
+        return False
+
+    document = {
+        "title": title,
+        "link": link,
+        "summary": None,
+        "img": article_data.get('img', None),
+        "epoch": epoch_time,
+        "topic": topic_name,
+        "created_at": datetime.utcnow(),
+        "priority":"low",
+        "status":"pending",
+        "send":False
+    }
+    
+    try:
+        result = collection.insert_one(document)
+        print(f"Saved article: {title}")
+        return True
+    except Exception as e:
+        print(f"Error saving article {title}: {str(e)}")
+        return False
+
+def process_news_data(data, topic_name, method_type):
+    saved_count = 0
     for i, item in enumerate(data, 1):
-        print(f"Article {i}:")
-        print(f"Title: {item.get('title', 'N/A')}")
-        print(f"Media: {item.get('media', 'N/A')}")
-        print(f"Link: {item.get('link', 'N/A')}")
-        print(f"Image: {item.get('img', 'N/A')}")
-        
         time_info, status = convert_to_epoch_and_time_ago(item.get('datetime'))
         if status:
-            print(f"Time info: {time_info}")
-        else:
-            print(f"Error: {item.get('datetime', 'N/A')}")
+            if save_to_mongodb(item, topic_name):
+                saved_count += 1
+            
+    print(f"Total articles saved: {saved_count}")
+
+def scrape_news():
+    print(f"\n{'='*80}")
+    print(f"Starting news scraping at {datetime.now()}")
+    print(f"{'='*80}")
+    
+    googlenews = GoogleNews(lang='en', region='US', period='1h')
+    
+    for topic_info in list_of_topics:
+        topic_name = topic_info["topic"]
+        topic_id = topic_info["topic_id"]
         
-        print("-" * 50)
+        try:
+            print(f"Processing {topic_name}...")
+            googlenews.clear()
+            googlenews.set_topic(topic_id)
+            googlenews.get_news()
+            topic_data = googlenews.results(sort=True)
+            process_news_data(topic_data, topic_name, "set_topic")
+            
+            time.sleep(2)
+            
+        except Exception as e:
+            print(f"Error processing topic {topic_name}: {str(e)}")
+    
+    print(f"News scraping completed at {datetime.now()}")
 
-# Initialize GoogleNews
-googlenews = GoogleNews(lang='en', region='US', period='1d')
+def run_scheduler():
+    while True:
+        schedule.run_pending()
+        time.sleep(1)
 
-for topic_info in list_of_topics:
-    topic_name = topic_info["topic"]
-    topic_id = topic_info["topic_id"]
+def main():
+    print("Starting News Summary AI with MongoDB integration...")
     
-    # Method 1: Using set_topic
-    print(f"Processing {topic_name} with set_topic...")
-    googlenews.clear()
-    googlenews.set_topic(topic_id)
-    topic_data = googlenews.results(sort=True)
-    process_news_data(topic_data, topic_name, "set_topic")
+    schedule.every(5).minutes.do(scrape_news)
     
-    # Wait 2 seconds
-    time.sleep(2)
+    print("Running initial scrape...")
+    scrape_news()
     
-    # Method 2: Using get_news
-    print(f"Processing {topic_name} with get_news...")
-    googlenews.clear()
-    googlenews.get_news(topic_name)
-    news_data = googlenews.results(sort=True)
-    process_news_data(news_data, topic_name, "get_news")
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
     
-    # Wait 2 seconds before next topic
-    time.sleep(2)
+    print("Scheduler started. Press Ctrl+C to stop.")
+    
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nStopping the application...")
+        client.close()
+
+if __name__ == "__main__":
+    main()
+ 
