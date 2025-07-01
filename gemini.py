@@ -1,4 +1,4 @@
-import google.generativeai as genai
+import requests
 import dotenv
 import os
 import json
@@ -13,25 +13,48 @@ import aiohttp
 
 dotenv.load_dotenv()
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 MONGO_URI = os.getenv("MONGO_DB_SRC")
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-
 DB_NAME = "AI"
 COLLECTION_NAME = "news"
+MODEL_ID = "gemini-2.5-flash-lite-preview-06-17"
 
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 collection = db[COLLECTION_NAME]
 
-model = genai.GenerativeModel(
-        model_name="gemini-2.5-pro",
-        generation_config={"response_mime_type": "application/json"},
-        system_instruction=system_prompt
-    )
+def call_gemini_api(input_text):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL_ID}:generateContent?key={GEMINI_API_KEY}"
+    
+    payload = {
+        "systemInstruction": {
+            "parts": [{"text": system_prompt}]
+        },
+        "contents": [
+            {
+                "role": "user",
+                "parts": [{"text": input_text}]
+            }
+        ],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "maxOutputTokens": 20000
+        }
+    }
+    
+    response = requests.post(url, json=payload)
+    result = response.json()
+    
+    if "candidates" in result and len(result["candidates"]) > 0:
+        parts = result["candidates"][0]["content"]["parts"]
+        if parts and len(parts) > 0:
+            return json.loads(parts[0]["text"])
+    
+    return None
 
-async def send_webhook_message(title, summary, img_url, priority):
+async def send_webhook_message(title, summary, img_url, priority, link):
     if priority == "high":
         color = 0xFF0000  
     elif priority == "medium":
@@ -42,19 +65,19 @@ async def send_webhook_message(title, summary, img_url, priority):
     embed = discord.Embed(
         title=title if title else "News Summary",
         color=color,
-        description=summary if summary else "No summary available."
+        description=summary
     )
-    if img_url:
-        embed.set_image(url=img_url)
-    
+
+    content = "@here" if priority == "high" else None
+
     async with aiohttp.ClientSession() as session:
         webhook = discord.Webhook.from_url(DISCORD_WEBHOOK_URL, session=session)
         await webhook.send(
             embed=embed,
             username="lisu",
-            avatar_url="https://www.thestatesman.com/wp-content/uploads/2025/05/blackpink-lisa-k-pop-lisa-documentary-jpg.webp"
+            avatar_url="https://www.thestatesman.com/wp-content/uploads/2025/05/blackpink-lisa-k-pop-lisa-documentary-jpg.webp",
+            content=content
         )
-    print("Message sent successfully!")
 
 def process_pending_article():
     doc = collection.find_one({"status": "pending"})
@@ -75,7 +98,7 @@ def process_pending_article():
         else:
             collection.update_one(
                 {"_id": doc["_id"]},
-                {"$set": {"status": "completed", "summary": True, "priority": None}}
+                {"$set": {"status": "failed", "summary": True, "priority": None}}
             )
             print(f"Decoding failed. Updated document {doc['_id']} as completed with summary=True.")
             return
@@ -83,38 +106,35 @@ def process_pending_article():
         print(f"Error decoding link: {e}")
         collection.update_one(
             {"_id": doc["_id"]},
-            {"$set": {"status": "completed", "summary": True, "priority": None}}
+            {"$set": {"status": "failed", "summary": True, "priority": None}}
         )
         print(f"Exception during decoding. Updated document {doc['_id']} as completed with summary=True.")
         return
 
-    response = model.generate_content(url_to_summarize)
-    try:
-        data = json.loads(response.text)
-    except Exception:
+    data = call_gemini_api(url_to_summarize)
+    if not data:
         collection.update_one(
             {"_id": doc["_id"]},
-            {"$set": {"status": "completed", "summary": True, "priority": None}}
+            {"$set": {"status": "failed", "summary": True, "priority": None}}
         )
         return
-    print(data)
 
     if data.get("status"):
-      update_fields = {
-          "status": "completed",
-          "send":True,
-          "summary": data.get("summary"),
-          "priority": data.get("priority")
-      }
-      collection.update_one({"_id": doc["_id"]}, {"$set": update_fields})
-      title = data.get("title") or doc.get("title")
-      summary = data.get("summary")
-      img_url = doc.get("img")
-      priority = data.get("priority")
+        update_fields = {
+            "status": "completed",
+            "send": True,
+            "summary": data.get("summary"),
+            "priority": data.get("priority")
+        }
+        collection.update_one({"_id": doc["_id"]}, {"$set": update_fields})
+        title = data.get("title") or doc.get("title")
+        summary = data.get("summary")
+        img_url = doc.get("img")
+        priority = data.get("priority")
 
-      import asyncio
-      asyncio.run(send_webhook_message(title, summary, img_url, priority))
-      print(f"Updated document {doc['_id']} with summary and priority.")
+        import asyncio
+        asyncio.run(send_webhook_message(title, summary, img_url, priority, url_to_summarize))
+        print(f"Updated document {doc['_id']} with summary and priority.")
     else:
         collection.update_one(
             {"_id": doc["_id"]},

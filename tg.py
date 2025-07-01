@@ -25,9 +25,10 @@ async def send_webhook_message():
         await webhook.send(
             embed=embed,
             username="lisu",
-            avatar_url="https://www.thestatesman.com/wp-content/uploads/2025/05/blackpink-lisa-k-pop-lisa-documentary-jpg.webp"
+            avatar_url="https://www.thestatesman.com/wp-content/uploads/2025/05/blackpink-lisa-k-pop-lisa-documentary-jpg.webp",
+            content="@here"
         )
     
     print("Message sent successfully!")
 
-send_webhook_message()
+asyncio.run(send_webhook_message()) 
